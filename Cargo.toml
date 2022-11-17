@@ -1,0 +1,8 @@
+[package]
+name = "allusion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam = { version = "0.8" }
+once_cell = { version = "1" }
