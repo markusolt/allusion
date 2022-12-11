@@ -1,6 +1,6 @@
 use std::{
-    cell::UnsafeCell, fmt, hash::Hash, mem::MaybeUninit, ptr::NonNull, sync::atomic::AtomicUsize,
-    sync::atomic::Ordering::Acquire, sync::atomic::Ordering::Relaxed,
+    cell::UnsafeCell, fmt, hash::Hash, mem, mem::MaybeUninit, ptr::NonNull,
+    sync::atomic::AtomicUsize, sync::atomic::Ordering::Acquire, sync::atomic::Ordering::Relaxed,
     sync::atomic::Ordering::Release,
 };
 
@@ -116,6 +116,8 @@ where
 impl<T> Drop for Strong<T> {
     fn drop(&mut self) {
         unsafe {
+            debug_assert!(self.node().strong.load(Acquire) > 0);
+
             if self.node().strong.fetch_sub(1, Release) == 1 {
                 let alloc = {
                     let node = UnsafeCell::raw_get(self.node.as_ptr())
@@ -171,7 +173,7 @@ impl<T> Strong<T> {
                     *node.strong.get_mut() = 1;
 
                     let gen = node.gen.get_mut();
-                    *gen += 1;
+                    *gen = gen.wrapping_add(1);
 
                     *gen
                 };
@@ -274,7 +276,32 @@ impl<T> Strong<T> {
     /// assert!(s.strong_count() == 1);
     /// ```
     pub fn downgrade(&self) -> Weak<T> {
-        Weak::new(self)
+        Weak {
+            node: self.node,
+            gen: self.gen,
+        }
+    }
+
+    /// Returns ownership of the contained value. Returns `Err` if there are multiple strong references
+    /// to the allocation.
+    pub fn into_inner(self) -> Result<T, Self> {
+        if let Err(strong) = self.node().strong.compare_exchange(1, 0, Acquire, Relaxed) {
+            debug_assert!(strong > 1);
+
+            return Err(self);
+        }
+
+        unsafe {
+            let node = UnsafeCell::raw_get(self.node.as_ptr())
+                .as_mut()
+                .unwrap_unchecked();
+
+            let ret = node.value.assume_init_read();
+            let _ = node.alloc.channel.0.send(self.node);
+            mem::forget(self);
+
+            Ok(ret)
+        }
     }
 
     /// Gets a raw pointer to the value.
@@ -300,7 +327,7 @@ impl<T> Clone for Strong<T> {
 /// A weak reference to an allocation. Unlike strong references these are not reference counted. You can
 /// duplicate weak references for free using the [`Copy`] trait.
 ///
-/// Weak reference cannot provide a reference to the stored value because the value may be freed at any
+/// Weak references cannot provide a reference to the stored value because the value may be freed at any
 /// time if another thread drops the last remaining strong reference. Instead you must first attempt to
 /// [`upgrade`][Weak::upgrade] the weak reference into a strong reference.
 ///
@@ -338,10 +365,7 @@ where
 impl<T> Weak<T> {
     /// See [`Strong::downgrade`].
     pub fn new(strong: &Strong<T>) -> Self {
-        Weak {
-            node: strong.node,
-            gen: strong.gen,
-        }
+        strong.downgrade()
     }
 
     /// Creates a strong reference to the allocation. Returns `None` if the allocation has already been

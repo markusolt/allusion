@@ -1,5 +1,5 @@
 use crate::{Allocator, Strong};
-use std::{mem::drop, sync::Arc};
+use std::{mem::drop, sync::Arc, thread};
 
 #[test]
 fn t001() {
@@ -36,4 +36,34 @@ fn t003() {
     assert!(Arc::strong_count(&arc) == 2);
     drop(w);
     assert!(Arc::strong_count(&arc) == 1);
+}
+
+#[test]
+fn t004() {
+    static ALLOC: Allocator<String> = Allocator::new();
+
+    {
+        let s = Strong::new(String::from("a"), &ALLOC);
+        assert!(s.into_inner().unwrap() == "a");
+    }
+
+    {
+        let s1 = Strong::new(String::from("b"), &ALLOC);
+        let s2 = s1.clone();
+        let s1 = s1.into_inner().unwrap_err();
+        drop(s2);
+        assert!(s1.into_inner().unwrap() == "b");
+    }
+
+    {
+        let s = Strong::new(String::from("c"), &ALLOC);
+        let w = s.downgrade();
+
+        for _ in 0..50 {
+            thread::spawn(move || {
+                drop(w.upgrade());
+            });
+        }
+        let _ = s.into_inner();
+    }
 }
