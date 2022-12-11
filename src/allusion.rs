@@ -61,14 +61,10 @@ where
     T: 'static,
 {
     channel: Lazy<(
-        channel::Sender<NonNull<Node<T>>>,
-        channel::Receiver<NonNull<Node<T>>>,
+        channel::Sender<AllowSend<NonNull<Node<T>>>>,
+        channel::Receiver<AllowSend<NonNull<Node<T>>>>,
     )>,
 }
-
-unsafe impl<T> Send for Allocator<T> where T: Send {}
-
-unsafe impl<T> Sync for Allocator<T> where T: Send {}
 
 impl<T> fmt::Debug for Allocator<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -91,14 +87,9 @@ impl<T> Default for Allocator<T> {
     }
 }
 
-struct Shared<T>
-where
-    T: 'static,
-{
-    strong: AtomicUsize,
-    gen: AtomicUsize,
-    alloc: &'static Allocator<T>,
-}
+struct AllowSend<T>(T);
+
+unsafe impl<T> Send for AllowSend<T> {}
 
 struct Node<T>
 where
@@ -106,6 +97,15 @@ where
 {
     value: UnsafeCell<MaybeUninit<T>>,
     shared: Shared<T>,
+}
+
+struct Shared<T>
+where
+    T: 'static,
+{
+    strong: AtomicUsize,
+    gen: AtomicUsize,
+    alloc: &'static Allocator<T>,
 }
 
 /// A reference counted pointer, very similar to [`Arc`].
@@ -133,7 +133,7 @@ impl<T> Drop for Strong<T> {
                     .unwrap_unchecked()
                     .assume_init_drop();
 
-                let _ = alloc.channel.0.send(self.node);
+                let _ = alloc.channel.0.send(AllowSend(self.node));
             }
         }
     }
@@ -168,7 +168,10 @@ impl<T> Strong<T> {
     pub fn new(value: T, allocator: &'static Allocator<T>) -> Self {
         unsafe {
             if let Ok(node) = allocator.channel.1.try_recv() {
-                let mut ret = Strong { node, gen: 0 };
+                let mut ret = Strong {
+                    node: node.0,
+                    gen: 0,
+                };
                 ret.as_ptr_mut().as_mut().unwrap_unchecked().write(value);
                 ret.gen = ret.shared().gen.fetch_add(1, SeqCst).wrapping_add(1);
                 ret.shared().strong.store(1, SeqCst);
@@ -301,7 +304,7 @@ impl<T> Strong<T> {
                 .unwrap_unchecked()
                 .assume_init_read()
         };
-        let _ = shared.alloc.channel.0.send(self.node);
+        let _ = shared.alloc.channel.0.send(AllowSend(self.node));
         mem::forget(self);
 
         Ok(ret)
