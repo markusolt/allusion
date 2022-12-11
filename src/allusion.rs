@@ -7,54 +7,20 @@ use std::{
 use crossbeam::channel;
 use once_cell::sync::Lazy;
 
-/// An `Allocator` is requried to create new allocations using [`Strong::new`]. The allocator is used
-/// to reuse heap allocations. Without allocators we would be leaking memory with every call to
-/// `Strong::new`.
+/// An `Allocator` is requried to create new allocations using [`Strong::with_allocator`]. The
+/// allocator is used to reuse heap allocations.
 ///
 /// You usually define a static allocator for every type `T` that you intend to use.
 ///
 /// ```
 /// # use allusion::{Allocator, Strong};
 /// static ALLOC_USIZE: Allocator<usize> = Allocator::new();
-/// let _s = Strong::new(5, &ALLOC_USIZE);
+/// let _s = Strong::with_allocator(5, &ALLOC_USIZE);
 /// ```
 ///
-/// You can also define a trait to provide a reference to the relevant static, but again, you must
-/// implement it for every type `T` you intend to use. There is no way to implement this genericly.
-///
-/// ```
-/// # use allusion::{Allocator, Strong};
-/// trait AllusionAllocator {
-///     fn alloc() -> &'static Allocator<Self> where Self: Sized;
-/// }
-///
-/// impl AllusionAllocator for usize {
-///     fn alloc() -> &'static Allocator<Self> {
-///         static ALLOC: Allocator<usize> = Allocator::new();
-///         &ALLOC
-///     }
-/// }
-///
-/// impl AllusionAllocator for f32 {
-///     fn alloc() -> &'static Allocator<Self> {
-///         static ALLOC: Allocator<f32> = Allocator::new();
-///         &ALLOC
-///     }
-/// }
-///
-/// fn alloc<T>() -> &'static Allocator<T> where T: AllusionAllocator {
-///     T::alloc()
-/// }
-///
-/// let _s = Strong::new(5usize, alloc());
-/// let _s = Strong::new(5.1f32, alloc());
-/// ```
-///
-/// You can also create a `&'static Allocator<T>` by [leaking][Box::leak] a [`Box`]. This will
-/// cause a memory leak that [`miri`](https://github.com/rust-lang/miri) will detect though.
-/// `static` variables get dropped when the application shuts down, leaked boxes do not. This
-/// kind of memory leak is totally fine though, the operating system will reclaim all memory after
-/// the application has shut down anyways.
+/// You can instead use [`Allocator::dynamic`]. This will perform worse than using a `static`
+/// variable, but it can be called with a generic type parameter. Creating strong pointers with
+/// this allocator can be done very easily using [`Strong::new`].
 #[derive()]
 pub struct Allocator<T>
 where
@@ -78,6 +44,31 @@ impl<T> Allocator<T> {
         Allocator {
             channel: Lazy::new(|| channel::unbounded()),
         }
+    }
+
+    /// Provides a `'static` allocator. Uses a [`HashMap`][std::collections::HashMap] to lazily
+    /// create allocators for different types `T`.
+    ///
+    /// It is recommended to use your own `static ALLOC: Allocator<T>` where possible, this dynamic
+    /// solution performs worse because it must lock a [`RwLock`][std::sync::RwLock] and look up
+    /// an entry in a hashmap. This is only provided for convenience and as a reference, you can
+    /// implement the same thing using the public api of `allusion`.
+    pub fn dynamic() -> &'static Self {
+        use std::{any::Any, any::TypeId, collections::HashMap, sync::RwLock};
+
+        static MAP: Lazy<RwLock<HashMap<TypeId, &'static (dyn Any + Send + Sync)>>> =
+            Lazy::new(|| RwLock::new(HashMap::new()));
+
+        if let Some(alloc) = MAP.read().unwrap().get(&TypeId::of::<T>()) {
+            return alloc.downcast_ref().unwrap();
+        }
+
+        MAP.write()
+            .unwrap()
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::leak(Box::new(Self::new())))
+            .downcast_ref()
+            .unwrap()
     }
 }
 
@@ -153,19 +144,32 @@ where
 }
 
 impl<T> Strong<T> {
-    /// Creates a new allocation to store the provided value. The `allocator` is used to recycle old
-    /// heap allocations.
+    /// Creates a new allocation using the default allocator [`Allocator::dynamic`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use allusion::{Allocator, Strong};
+    /// let s = Strong::new(5);
+    ///
+    /// // the above is equivalent to
+    /// let s = Strong::with_allocator(5, Allocator::dynamic());
+    /// ```
+    pub fn new(value: T) -> Self {
+        Self::with_allocator(value, Allocator::dynamic())
+    }
+
+    /// Creates a new allocation using the provided allocator.
     ///
     /// # Examples
     ///
     /// ```
     /// # use allusion::{Allocator, Strong};
     /// static ALLOC: Allocator<usize> = Allocator::new();
-    /// let s = Strong::new(5, &ALLOC);
     ///
-    /// assert!(s.get() == &5);
+    /// let s = Strong::with_allocator(5, &ALLOC);
     /// ```
-    pub fn new(value: T, allocator: &'static Allocator<T>) -> Self {
+    pub fn with_allocator(value: T, allocator: &'static Allocator<T>) -> Self {
         unsafe {
             if let Ok(node) = allocator.channel.1.try_recv() {
                 let mut ret = Strong {
@@ -198,10 +202,8 @@ impl<T> Strong<T> {
     /// # Examples
     ///
     /// ```
-    /// # use allusion::{Allocator, Strong};
-    /// static ALLOC: Allocator<usize> = Allocator::new();
-    /// let s = Strong::new(5, &ALLOC);
-    ///
+    /// # use allusion::Strong;
+    /// let s = Strong::new(5);
     /// assert!(s.get() == &5);
     /// ```
     pub fn get(&self) -> &T {
@@ -218,11 +220,10 @@ impl<T> Strong<T> {
     /// # Examples
     ///
     /// ```
-    /// # use allusion::{Allocator, Strong};
-    /// static ALLOC: Allocator<usize> = Allocator::new();
-    /// let s1 = Strong::new(5, &ALLOC);
-    ///
+    /// # use allusion::Strong;
+    /// let s1 = Strong::new(5);
     /// let s2 = s1.clone();
+    ///
     /// assert!(s1.as_ptr() == s2.as_ptr());
     /// ```
     pub fn clone(&self) -> Self {
@@ -234,20 +235,18 @@ impl<T> Strong<T> {
         }
     }
 
-    /// Gets the number of strong references to this allocation.
+    /// Gets the number of strong pointers to this allocation.
     ///
-    /// Always returns a positive value because the count includes `&self`. The same method is also
-    /// available on [`Weak::strong_count`], through that version can return `0` when there are no
-    /// more strong references to the allocation.
+    /// Always returns a positive value because the count includes `self`. The same method is also
+    /// available on [`Weak::strong_count`], althrough that version can return `0` when there are no
+    /// more strong pointers to the allocation.
     ///
     /// # Examples
     ///
     /// ```
     /// # use std::mem::drop;
-    /// # use allusion::{Allocator, Strong};
-    /// static ALLOC: Allocator<usize> = Allocator::new();
-    /// let s1 = Strong::new(1, &ALLOC);
-    ///
+    /// # use allusion::Strong;
+    /// let s1 = Strong::new(5);
     /// assert!(s1.strong_count() == 1);
     ///
     /// let s2 = s1.clone();
@@ -266,17 +265,16 @@ impl<T> Strong<T> {
         self.shared().strong.load(Acquire)
     }
 
-    /// Creates a new weak reference to the allocation.
+    /// Creates a new weak pointer to the allocation.
     ///
     /// # Examples
     ///
     /// ```
     /// # use std::mem::drop;
-    /// # use allusion::{Allocator, Strong};
-    /// static ALLOC: Allocator<usize> = Allocator::new();
-    /// let s = Strong::new(1, &ALLOC);
-    ///
+    /// # use allusion::Strong;
+    /// let s = Strong::new(5);
     /// let w = s.downgrade();
+    ///
     /// assert!(s.as_ptr() == w.as_ptr());
     /// assert!(s.strong_count() == 1);
     /// ```
@@ -287,7 +285,7 @@ impl<T> Strong<T> {
         }
     }
 
-    /// Returns ownership of the contained value. Returns `Err` if there are multiple strong references
+    /// Returns ownership of the contained value. Returns `Err` if there are multiple strong pointers
     /// to the allocation.
     pub fn into_inner(self) -> Result<T, Self> {
         let shared = self.shared();
@@ -334,16 +332,16 @@ impl<T> Clone for Strong<T> {
     }
 }
 
-/// A weak reference to an allocation. Unlike strong references these are not reference counted. You can
-/// duplicate weak references for free using the [`Copy`] trait.
+/// A weak pointer to an allocation. Unlike strong pointers these are not reference counted. You can
+/// duplicate weak pointers for free using the [`Copy`] trait.
 ///
-/// Weak references cannot provide a reference to the stored value because the value may be freed at any
-/// time if another thread drops the last remaining strong reference. Instead you must first attempt to
-/// [`upgrade`][Weak::upgrade] the weak reference into a strong reference.
+/// Weak pointers cannot provide a reference to the stored value because the value may be freed at any
+/// time if another thread drops the last remaining strong pointer. Instead you must first attempt to
+/// [`upgrade`][Weak::upgrade] the weak pointer into a strong pointer.
 ///
-/// There is a tiny chance that a weak reference will successfully upgrade into a strong containing an
+/// There is a tiny chance that a weak pointer will successfully upgrade into a strong containing an
 /// unexpected value. This can happen because the memory allocations are reused. Usually this will be
-/// detected by comparing a `generation: usize` stored in the weak reference which can be compared to the
+/// detected by comparing a `generation: usize` stored in the weak pointer which can be compared to the
 /// allocations `generation`. The generation will however wrap around once the allocation has been reused
 /// `2^64` times.
 #[derive()]
@@ -378,18 +376,17 @@ impl<T> Weak<T> {
         strong.downgrade()
     }
 
-    /// Creates a strong reference to the allocation. Returns `None` if the allocation has already been
-    /// freed because there are no more strong references to it.
+    /// Creates a strong pointer to the allocation. Returns `None` if the allocation has already been
+    /// freed because there are no more strong pointers to it.
     ///
     /// # Examples
     ///
     /// ```
     /// # use std::mem::drop;
-    /// # use allusion::{Allocator, Strong};
-    /// static ALLOC: Allocator<usize> = Allocator::new();
-    /// let s = Strong::new(5, &ALLOC);
-    ///
+    /// # use allusion::Strong;
+    /// let s = Strong::new(5);
     /// let w = s.downgrade();
+    ///
     /// assert!(w.upgrade().unwrap().get() == &5);
     ///
     /// drop(s);
