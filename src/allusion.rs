@@ -1,7 +1,7 @@
 use std::{
-    cell::UnsafeCell, fmt, hash::Hash, mem, mem::MaybeUninit, ptr::NonNull,
+    cell::UnsafeCell, fmt, hash::Hash, mem, mem::MaybeUninit, ptr, ptr::NonNull,
     sync::atomic::AtomicUsize, sync::atomic::Ordering::Acquire, sync::atomic::Ordering::Relaxed,
-    sync::atomic::Ordering::Release,
+    sync::atomic::Ordering::Release, sync::atomic::Ordering::SeqCst,
 };
 
 use crossbeam::channel;
@@ -61,8 +61,8 @@ where
     T: 'static,
 {
     channel: Lazy<(
-        channel::Sender<NonNull<UnsafeCell<Node<T>>>>,
-        channel::Receiver<NonNull<UnsafeCell<Node<T>>>>,
+        channel::Sender<NonNull<Node<T>>>,
+        channel::Receiver<NonNull<Node<T>>>,
     )>,
 }
 
@@ -91,14 +91,21 @@ impl<T> Default for Allocator<T> {
     }
 }
 
+struct Shared<T>
+where
+    T: 'static,
+{
+    strong: AtomicUsize,
+    gen: AtomicUsize,
+    alloc: &'static Allocator<T>,
+}
+
 struct Node<T>
 where
     T: 'static,
 {
-    value: MaybeUninit<T>,
-    strong: AtomicUsize,
-    gen: AtomicUsize,
-    alloc: &'static Allocator<T>,
+    value: UnsafeCell<MaybeUninit<T>>,
+    shared: Shared<T>,
 }
 
 /// A reference counted pointer, very similar to [`Arc`].
@@ -109,24 +116,22 @@ pub struct Strong<T>
 where
     T: 'static,
 {
-    node: NonNull<UnsafeCell<Node<T>>>,
+    node: NonNull<Node<T>>,
     gen: usize,
 }
 
 impl<T> Drop for Strong<T> {
     fn drop(&mut self) {
         unsafe {
-            debug_assert!(self.node().strong.load(Acquire) > 0);
+            let shared = self.shared();
+            debug_assert!(shared.strong.load(Acquire) > 0);
 
-            if self.node().strong.fetch_sub(1, Release) == 1 {
-                let alloc = {
-                    let node = UnsafeCell::raw_get(self.node.as_ptr())
-                        .as_mut()
-                        .unwrap_unchecked();
-
-                    node.value.assume_init_drop();
-                    node.alloc
-                };
+            if shared.strong.fetch_sub(1, Release) == 1 {
+                let alloc = shared.alloc;
+                self.as_ptr_mut()
+                    .as_mut()
+                    .unwrap_unchecked()
+                    .assume_init_drop();
 
                 let _ = alloc.channel.0.send(self.node);
             }
@@ -163,30 +168,22 @@ impl<T> Strong<T> {
     pub fn new(value: T, allocator: &'static Allocator<T>) -> Self {
         unsafe {
             if let Ok(node) = allocator.channel.1.try_recv() {
-                let gen = {
-                    let node = UnsafeCell::raw_get(node.as_ptr())
-                        .as_mut()
-                        .unwrap_unchecked();
-                    node.value.write(value);
+                let mut ret = Strong { node, gen: 0 };
+                ret.as_ptr_mut().as_mut().unwrap_unchecked().write(value);
+                ret.gen = ret.shared().gen.fetch_add(1, SeqCst).wrapping_add(1);
+                ret.shared().strong.store(1, SeqCst);
 
-                    debug_assert!(*node.strong.get_mut() == 0);
-                    *node.strong.get_mut() = 1;
-
-                    let gen = node.gen.get_mut();
-                    *gen = gen.wrapping_add(1);
-
-                    *gen
-                };
-
-                Strong { node, gen }
+                ret
             } else {
                 let gen = 0;
-                let node = NonNull::from(Box::leak(Box::new(UnsafeCell::new(Node {
-                    value: MaybeUninit::new(value),
-                    strong: AtomicUsize::new(1),
-                    gen: AtomicUsize::new(gen),
-                    alloc: allocator,
-                }))));
+                let node = NonNull::from(Box::leak(Box::new(Node {
+                    value: UnsafeCell::new(MaybeUninit::new(value)),
+                    shared: Shared {
+                        strong: AtomicUsize::new(1),
+                        gen: AtomicUsize::new(gen),
+                        alloc: allocator,
+                    },
+                })));
 
                 Strong { node, gen }
             }
@@ -205,7 +202,12 @@ impl<T> Strong<T> {
     /// assert!(s.get() == &5);
     /// ```
     pub fn get(&self) -> &T {
-        unsafe { self.node().value.assume_init_ref() }
+        unsafe {
+            self.as_ptr_mut()
+                .as_ref()
+                .unwrap_unchecked()
+                .assume_init_ref()
+        }
     }
 
     /// Clones the `Strong`. This creates another pointer to the same allocation.
@@ -221,7 +223,7 @@ impl<T> Strong<T> {
     /// assert!(s1.as_ptr() == s2.as_ptr());
     /// ```
     pub fn clone(&self) -> Self {
-        self.node().strong.fetch_add(1, Relaxed);
+        self.shared().strong.fetch_add(1, Relaxed);
 
         Strong {
             node: self.node,
@@ -258,7 +260,7 @@ impl<T> Strong<T> {
     /// assert!(w.strong_count() == 0);
     /// ```
     pub fn strong_count(&self) -> usize {
-        self.node().strong.load(Acquire)
+        self.shared().strong.load(Acquire)
     }
 
     /// Creates a new weak reference to the allocation.
@@ -285,33 +287,38 @@ impl<T> Strong<T> {
     /// Returns ownership of the contained value. Returns `Err` if there are multiple strong references
     /// to the allocation.
     pub fn into_inner(self) -> Result<T, Self> {
-        if let Err(strong) = self.node().strong.compare_exchange(1, 0, Acquire, Relaxed) {
+        let shared = self.shared();
+
+        if let Err(strong) = shared.strong.compare_exchange(1, 0, Acquire, Relaxed) {
             debug_assert!(strong > 1);
 
             return Err(self);
         }
 
-        unsafe {
-            let node = UnsafeCell::raw_get(self.node.as_ptr())
+        let ret = unsafe {
+            self.as_ptr_mut()
                 .as_mut()
-                .unwrap_unchecked();
+                .unwrap_unchecked()
+                .assume_init_read()
+        };
+        let _ = shared.alloc.channel.0.send(self.node);
+        mem::forget(self);
 
-            let ret = node.value.assume_init_read();
-            let _ = node.alloc.channel.0.send(self.node);
-            mem::forget(self);
-
-            Ok(ret)
-        }
+        Ok(ret)
     }
 
     /// Gets a raw pointer to the value.
     pub fn as_ptr(&self) -> *const T {
-        self.node().value.as_ptr()
+        self.as_ptr_mut() as *const T
     }
 
-    fn node(&self) -> &Node<T> {
+    fn as_ptr_mut(&self) -> *mut MaybeUninit<T> {
+        unsafe { UnsafeCell::raw_get(ptr::addr_of!((*self.node.as_ptr()).value)) }
+    }
+
+    fn shared(&self) -> &Shared<T> {
         unsafe {
-            UnsafeCell::raw_get(self.node.as_ptr())
+            ptr::addr_of!((*self.node.as_ptr()).shared)
                 .as_ref()
                 .unwrap_unchecked()
         }
@@ -341,7 +348,7 @@ pub struct Weak<T>
 where
     T: 'static,
 {
-    node: NonNull<UnsafeCell<Node<T>>>,
+    node: NonNull<Node<T>>,
     gen: usize,
 }
 
@@ -386,15 +393,15 @@ impl<T> Weak<T> {
     /// assert!(w.upgrade().is_none());
     /// ```
     pub fn upgrade(&self) -> Option<Strong<T>> {
-        let node = self.node();
+        let shared = self.shared();
 
-        let mut n = node.strong.load(Relaxed);
+        let mut n = shared.strong.load(Relaxed);
         loop {
             if n == 0 {
                 return None;
             }
 
-            match node
+            match shared
                 .strong
                 .compare_exchange_weak(n, n + 1, Acquire, Relaxed)
             {
@@ -405,10 +412,12 @@ impl<T> Weak<T> {
 
         let ret = Strong {
             node: self.node,
-            gen: node.gen.load(Acquire),
+            gen: shared.gen.load(Acquire),
         };
 
         if ret.gen != self.gen {
+            drop(ret);
+
             return None;
         }
 
@@ -417,10 +426,10 @@ impl<T> Weak<T> {
 
     /// See [`Strong::strong_count`].
     pub fn strong_count(&self) -> usize {
-        let node = self.node();
+        let shared = self.shared();
 
-        let n = node.strong.load(Acquire);
-        if self.gen == node.gen.load(Acquire) {
+        let n = shared.strong.load(Acquire);
+        if self.gen == shared.gen.load(Acquire) {
             n
         } else {
             0
@@ -429,12 +438,16 @@ impl<T> Weak<T> {
 
     /// Gets a raw pointer to the value.
     pub fn as_ptr(&self) -> *const T {
-        self.node().value.as_ptr()
+        self.as_ptr_mut() as *const T
     }
 
-    fn node(&self) -> &Node<T> {
+    fn as_ptr_mut(&self) -> *mut MaybeUninit<T> {
+        unsafe { UnsafeCell::raw_get(ptr::addr_of!((*self.node.as_ptr()).value)) }
+    }
+
+    fn shared(&self) -> &Shared<T> {
         unsafe {
-            UnsafeCell::raw_get(self.node.as_ptr())
+            ptr::addr_of!((*self.node.as_ptr()).shared)
                 .as_ref()
                 .unwrap_unchecked()
         }
