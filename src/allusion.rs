@@ -1,7 +1,7 @@
 use std::{
     cell::UnsafeCell, fmt, hash::Hash, mem, mem::MaybeUninit, ptr, ptr::NonNull,
     sync::atomic::AtomicUsize, sync::atomic::Ordering::Acquire, sync::atomic::Ordering::Relaxed,
-    sync::atomic::Ordering::Release, sync::atomic::Ordering::SeqCst,
+    sync::atomic::Ordering::Release,
 };
 
 use crossbeam::channel;
@@ -99,7 +99,7 @@ where
     alloc: &'static Allocator<T>,
 }
 
-/// A reference counted pointer, very similar to [`Arc`].
+/// A reference counted pointer, similar to [`Arc`].
 ///
 /// [`Arc`]: std::sync::Arc
 #[derive()]
@@ -171,29 +171,52 @@ impl<T> Strong<T> {
     /// ```
     pub fn with_allocator(value: T, allocator: &'static Allocator<T>) -> Self {
         unsafe {
-            if let Ok(node) = allocator.channel.1.try_recv() {
+            while let Ok(node) = allocator.channel.1.try_recv() {
                 let mut ret = Strong {
                     node: node.0,
                     gen: 0,
                 };
+
+                let gen: usize = if let Some(gen) = ret.shared().gen.load(Acquire).checked_add(1) {
+                    gen
+                } else {
+                    // we have exhausted the value space of `gen`. there is no safe way to reuse this
+                    // allocation, so we ignore it and try again.
+                    //
+                    // this heap allocation will never be freed and can be considered a memory leak.
+                    // remember though that this only happens after an allocation has been used `2^64`
+                    // times, which is unlikely to occur in practice (on some systems `usize` is
+                    // smaller than 64 bits, so this may happen much more often there).
+                    //
+                    // if we reuse the allocation 1 million times per second it would take over 500
+                    // thousand years to exhaust 64 bits. it is safe to assume this will never happen.
+                    // it would only take a little over an hour to exhaust 32 bits though.
+
+                    continue;
+                };
+
                 ret.as_ptr_mut().as_mut().unwrap_unchecked().write(value);
-                ret.gen = ret.shared().gen.fetch_add(1, SeqCst).wrapping_add(1);
-                ret.shared().strong.store(1, SeqCst);
+                ret.gen = gen;
 
-                ret
-            } else {
-                let gen = 0;
-                let node = NonNull::from(Box::leak(Box::new(Node {
-                    value: UnsafeCell::new(MaybeUninit::new(value)),
-                    shared: Shared {
-                        strong: AtomicUsize::new(1),
-                        gen: AtomicUsize::new(gen),
-                        alloc: allocator,
-                    },
-                })));
+                // we first update `gen` before we update `strong`, so that existing weak pointers to
+                // old generations have no chance to upgrade into a strong pointer.
+                ret.shared().gen.store(gen, Release);
+                ret.shared().strong.store(1, Release);
 
-                Strong { node, gen }
+                return ret;
             }
+
+            let gen = 0;
+            let node = NonNull::from(Box::leak(Box::new(Node {
+                value: UnsafeCell::new(MaybeUninit::new(value)),
+                shared: Shared {
+                    strong: AtomicUsize::new(1),
+                    gen: AtomicUsize::new(gen),
+                    alloc: allocator,
+                },
+            })));
+
+            Strong { node, gen }
         }
     }
 
@@ -338,12 +361,6 @@ impl<T> Clone for Strong<T> {
 /// Weak pointers cannot provide a reference to the stored value because the value may be freed at any
 /// time if another thread drops the last remaining strong pointer. Instead you must first attempt to
 /// [`upgrade`][Weak::upgrade] the weak pointer into a strong pointer.
-///
-/// There is a tiny chance that a weak pointer will successfully upgrade into a strong containing an
-/// unexpected value. This can happen because the memory allocations are reused. Usually this will be
-/// detected by comparing a `generation: usize` stored in the weak pointer which can be compared to the
-/// allocations `generation`. The generation will however wrap around once the allocation has been reused
-/// `2^64` times.
 #[derive()]
 pub struct Weak<T>
 where
