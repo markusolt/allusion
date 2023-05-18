@@ -20,7 +20,7 @@ use once_cell::sync::Lazy;
 ///
 /// You can instead use [`Allocator::dynamic`]. This will perform worse than using a `static`
 /// variable, but it can be called with a generic type parameter. Creating strong pointers with
-/// this allocator can be done very easily using [`Strong::new`].
+/// this allocator can be done more easily using [`Strong::new`].
 #[derive()]
 pub struct Allocator<T>
 where
@@ -336,6 +336,10 @@ impl<T> Strong<T> {
         self.as_ptr_mut() as *const T
     }
 
+    pub fn to_raw(&self) -> (usize, usize) {
+        (self.node.as_ptr() as usize, self.gen)
+    }
+
     fn as_ptr_mut(&self) -> *mut MaybeUninit<T> {
         unsafe { UnsafeCell::raw_get(ptr::addr_of!((*self.node.as_ptr()).value)) }
     }
@@ -458,6 +462,10 @@ impl<T> Weak<T> {
         self.as_ptr_mut() as *const T
     }
 
+    pub fn to_raw(&self) -> (usize, usize) {
+        (self.node.as_ptr() as usize, self.gen)
+    }
+
     fn as_ptr_mut(&self) -> *mut MaybeUninit<T> {
         unsafe { UnsafeCell::raw_get(ptr::addr_of!((*self.node.as_ptr()).value)) }
     }
@@ -487,11 +495,11 @@ impl<T> Copy for Weak<T> {}
 
 impl<T> PartialEq for Weak<T> {
     fn eq(&self, other: &Self) -> bool {
-        PartialEq::eq(&(self.node, self.gen), &(other.node, other.gen))
+        PartialEq::eq(&self.to_raw(), &other.to_raw())
     }
 
     fn ne(&self, other: &Self) -> bool {
-        PartialEq::ne(&(self.node, self.gen), &(other.node, other.gen))
+        PartialEq::ne(&self.to_raw(), &other.to_raw())
     }
 }
 
@@ -499,18 +507,18 @@ impl<T> Eq for Weak<T> {}
 
 impl<T> PartialOrd for Weak<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        PartialOrd::partial_cmp(&(self.node, self.gen), &(other.node, other.gen))
+        PartialOrd::partial_cmp(&self.to_raw(), &other.to_raw())
     }
 }
 
 impl<T> Ord for Weak<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        Ord::cmp(&(self.node, self.gen), &(other.node, other.gen))
+        Ord::cmp(&self.to_raw(), &other.to_raw())
     }
 }
 
 impl<T> Hash for Weak<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        Hash::hash(&(self.node, self.gen), state)
+        Hash::hash(&self.to_raw(), state)
     }
 }
