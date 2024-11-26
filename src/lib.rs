@@ -11,10 +11,11 @@
 //! An additional downside is the need of an [`Allocator`]. Because weak pointers are `Copy`
 //! and have no lifetime we can never free the memory allocation that the weak pointer is
 //! pointing to. We can however reuse the memory allocation once there are no more strong
-//! pointers to it by incrementing a `generation` field. The `Allocator` is used to recycle
+//! pointers pointing to it by incrementing an `era` field. The `Allocator` is used to recycle
 //! such old allocations. The function [`Allocator::dynamic`] provides allocators for any
-//! requested type `T` using a hashmap. This dynamic allocator provider is very convinient if
-//! you can accept the perfomance cost of looking up the needed allocator in a hashmap.
+//! requested type `T` using a hashmap over the [`TypeId`][std::any::TypeId]. This dynamic
+//! allocator provider is very convinient if you can accept the perfomance cost of looking up
+//! the needed allocator in a hashmap.
 
 mod allusion;
 

@@ -95,7 +95,7 @@ where
     T: 'static,
 {
     strong: AtomicUsize,
-    gen: AtomicUsize,
+    era: AtomicUsize,
     alloc: &'static Allocator<T>,
 }
 
@@ -108,7 +108,7 @@ where
     T: 'static,
 {
     node: NonNull<Node<T>>,
-    gen: usize,
+    era: usize,
 }
 
 impl<T> Drop for Strong<T> {
@@ -175,13 +175,13 @@ impl<T> Strong<T> {
             while let Ok(node) = recv.try_recv() {
                 let mut ret = Strong {
                     node: node.0,
-                    gen: 0,
+                    era: 0,
                 };
 
-                let gen: usize = if let Some(gen) = ret.shared().gen.load(Acquire).checked_add(1) {
-                    gen
+                let era: usize = if let Some(era) = ret.shared().era.load(Acquire).checked_add(1) {
+                    era
                 } else {
-                    // we have exhausted the value space of `gen`. there is no safe way to reuse this
+                    // we have exhausted the value space of `era`. there is no safe way to reuse this
                     // allocation, so we ignore it and try again.
                     //
                     // this heap allocation will never be freed and can be considered a memory leak.
@@ -197,27 +197,27 @@ impl<T> Strong<T> {
                 };
 
                 ret.as_ptr_mut().as_mut().unwrap_unchecked().write(value);
-                ret.gen = gen;
+                ret.era = era;
 
-                // we first update `gen` before we update `strong`, so that existing weak pointers to
-                // old generations have no chance to upgrade into a strong pointer.
-                ret.shared().gen.store(gen, Release);
+                // we update `era` before `strong` so that old weak pointers never observe a positive
+                // strong count paired with the old `era`.
+                ret.shared().era.store(era, Release);
                 ret.shared().strong.store(1, Release);
 
                 return ret;
             }
 
-            let gen = 0;
+            let era = 0;
             let node = NonNull::from(Box::leak(Box::new(Node {
                 value: UnsafeCell::new(MaybeUninit::new(value)),
                 shared: Shared {
                     strong: AtomicUsize::new(1),
-                    gen: AtomicUsize::new(gen),
+                    era: AtomicUsize::new(era),
                     alloc: allocator,
                 },
             })));
 
-            Strong { node, gen }
+            Strong { node, era }
         }
     }
 
@@ -255,7 +255,7 @@ impl<T> Strong<T> {
 
         Strong {
             node: self.node,
-            gen: self.gen,
+            era: self.era,
         }
     }
 
@@ -305,7 +305,7 @@ impl<T> Strong<T> {
     pub fn downgrade(&self) -> Weak<T> {
         Weak {
             node: self.node,
-            gen: self.gen,
+            era: self.era,
         }
     }
 
@@ -344,7 +344,7 @@ impl<T> Strong<T> {
     }
 
     pub fn to_raw(&self) -> (usize, usize) {
-        (self.node.as_ptr() as usize, self.gen)
+        (self.node.as_ptr() as usize, self.era)
     }
 
     fn as_ptr_mut(&self) -> *mut MaybeUninit<T> {
@@ -378,7 +378,7 @@ where
     T: 'static,
 {
     node: NonNull<Node<T>>,
-    gen: usize,
+    era: usize,
 }
 
 unsafe impl<T> Send for Weak<T> where T: Send + Sync {}
@@ -440,10 +440,10 @@ impl<T> Weak<T> {
 
         let ret = Strong {
             node: self.node,
-            gen: shared.gen.load(Acquire),
+            era: shared.era.load(Acquire),
         };
 
-        if ret.gen != self.gen {
+        if ret.era != self.era {
             drop(ret);
 
             return None;
@@ -457,7 +457,7 @@ impl<T> Weak<T> {
         let shared = self.shared();
 
         let n = shared.strong.load(Acquire);
-        if self.gen == shared.gen.load(Acquire) {
+        if self.era == shared.era.load(Acquire) {
             n
         } else {
             0
@@ -470,7 +470,7 @@ impl<T> Weak<T> {
     }
 
     pub fn to_raw(&self) -> (usize, usize) {
-        (self.node.as_ptr() as usize, self.gen)
+        (self.node.as_ptr() as usize, self.era)
     }
 
     fn as_ptr_mut(&self) -> *mut MaybeUninit<T> {
