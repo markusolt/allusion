@@ -1,11 +1,10 @@
 use std::{
     cell::UnsafeCell, fmt, hash::Hash, mem, mem::MaybeUninit, ptr, ptr::NonNull,
     sync::atomic::AtomicUsize, sync::atomic::Ordering::Acquire, sync::atomic::Ordering::Relaxed,
-    sync::atomic::Ordering::Release,
+    sync::atomic::Ordering::Release, sync::OnceLock,
 };
 
 use crossbeam::channel;
-use once_cell::sync::Lazy;
 
 /// An `Allocator` is requried to create new allocations using [`Strong::with_allocator`]. The
 /// allocator is used to reuse heap allocations.
@@ -26,7 +25,7 @@ pub struct Allocator<T>
 where
     T: 'static,
 {
-    channel: Lazy<(
+    channel: OnceLock<(
         channel::Sender<AllowSend<NonNull<Node<T>>>>,
         channel::Receiver<AllowSend<NonNull<Node<T>>>>,
     )>,
@@ -42,7 +41,7 @@ impl<T> Allocator<T> {
     /// Creates a new allocator.
     pub const fn new() -> Self {
         Allocator {
-            channel: Lazy::new(|| channel::unbounded()),
+            channel: OnceLock::new(),
         }
     }
 
@@ -56,14 +55,15 @@ impl<T> Allocator<T> {
     pub fn dynamic() -> &'static Self {
         use std::{any::Any, any::TypeId, collections::HashMap, sync::RwLock};
 
-        static MAP: Lazy<RwLock<HashMap<TypeId, &'static (dyn Any + Send + Sync)>>> =
-            Lazy::new(|| RwLock::new(HashMap::new()));
+        static MAP: OnceLock<RwLock<HashMap<TypeId, &'static (dyn Any + Send + Sync)>>> =
+            OnceLock::new();
+        let map = MAP.get_or_init(|| RwLock::new(HashMap::new()));
 
-        if let Some(alloc) = MAP.read().unwrap().get(&TypeId::of::<T>()) {
+        if let Some(alloc) = map.read().unwrap().get(&TypeId::of::<T>()) {
             return alloc.downcast_ref().unwrap();
         }
 
-        MAP.write()
+        map.write()
             .unwrap()
             .entry(TypeId::of::<T>())
             .or_insert_with(|| Box::leak(Box::new(Self::new())))
@@ -124,7 +124,7 @@ impl<T> Drop for Strong<T> {
                     .unwrap_unchecked()
                     .assume_init_drop();
 
-                let _ = alloc.channel.0.send(AllowSend(self.node));
+                let _ = alloc.channel.get().unwrap().0.send(AllowSend(self.node));
             }
         }
     }
@@ -171,7 +171,8 @@ impl<T> Strong<T> {
     /// ```
     pub fn with_allocator(value: T, allocator: &'static Allocator<T>) -> Self {
         unsafe {
-            while let Ok(node) = allocator.channel.1.try_recv() {
+            let recv = &allocator.channel.get_or_init(|| channel::unbounded()).1;
+            while let Ok(node) = recv.try_recv() {
                 let mut ret = Strong {
                     node: node.0,
                     gen: 0,
@@ -325,7 +326,13 @@ impl<T> Strong<T> {
                 .unwrap_unchecked()
                 .assume_init_read()
         };
-        let _ = shared.alloc.channel.0.send(AllowSend(self.node));
+        let _ = shared
+            .alloc
+            .channel
+            .get()
+            .unwrap()
+            .0
+            .send(AllowSend(self.node));
         mem::forget(self);
 
         Ok(ret)
